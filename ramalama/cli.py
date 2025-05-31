@@ -24,11 +24,13 @@ import ramalama.rag
 from ramalama import engine
 from ramalama.common import accel_image, exec_cmd, get_accel, get_cmd_with_wrapper, perror
 from ramalama.config import CONFIG
+from ramalama.logger import configure_logger, logger
 from ramalama.migrate import ModelStoreImport
 from ramalama.model import MODEL_TYPES
-from ramalama.model_factory import ModelFactory
+from ramalama.model_factory import ModelFactory, New
 from ramalama.model_store import GlobalModelStore
 from ramalama.shortnames import Shortnames
+from ramalama.stack import Stack
 from ramalama.version import print_version, version
 
 shortnames = Shortnames()
@@ -270,6 +272,8 @@ def post_parse_setup(args):
     if hasattr(args, "runtime_args"):
         args.runtime_args = shlex.split(args.runtime_args)
 
+    configure_logger("DEBUG" if args.debug else "WARNING")
+
 
 def login_parser(subparsers):
     parser = subparsers.add_parser("login", help="login to remote registry")
@@ -465,9 +469,7 @@ def get_size(path):
 def _list_models(args):
     mycwd = os.getcwd()
     if args.use_model_store:
-        models = GlobalModelStore(args.store).list_models(
-            engine=args.engine, debug=args.debug, show_container=args.container
-        )
+        models = GlobalModelStore(args.store).list_models(engine=args.engine, show_container=args.container)
         ret = []
         local_timezone = datetime.now().astimezone().tzinfo
 
@@ -726,12 +728,18 @@ def push_cli(args):
             m = ModelFactory(target, args).create_oci()
             m.push(source_model, args)
         except Exception as e1:
-            if args.debug:
-                print(e1)
+            logger.debug(e1)
             raise e
 
 
 def runtime_options(parser, command):
+    if command in ["run", "serve"]:
+        parser.add_argument(
+            "--api",
+            default=CONFIG["api"],
+            choices=["llama-stack", "none"],
+            help="unified API layer for for Inference, RAG, Agents, Tools, Safety, Evals, and Telemetry.",
+        )
     parser.add_argument("--authfile", help="path of the authentication file")
     if command in ["run", "perplexity", "serve"]:
         parser.add_argument(
@@ -937,6 +945,13 @@ def serve_cli(args):
     if args.rag:
         _get_rag(args)
 
+    if args.api == "llama-stack":
+        if not args.container:
+            raise ValueError("ramalama serve --api llama-stack command cannot be run with the --nocontainer option.")
+
+        stack = Stack(args)
+        return stack.serve()
+
     try:
         model = New(args.MODEL, args)
         model.serve(args)
@@ -1079,15 +1094,9 @@ def rm_cli(args):
     if len(args.MODEL) > 0:
         raise IndexError("can not specify --all as well MODEL")
 
-    models = GlobalModelStore(args.store).list_models(
-        engine=args.engine, debug=args.debug, show_container=args.container
-    )
+    models = GlobalModelStore(args.store).list_models(engine=args.engine, show_container=args.container)
 
     return _rm_model([model for model in models.keys()], args)
-
-
-def New(model, args, transport=CONFIG["transport"]):
-    return ModelFactory(model, args, transport=transport).create()
 
 
 def client_cli(args):

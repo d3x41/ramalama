@@ -1,6 +1,6 @@
-import logging
 import os
 import shutil
+import sys
 import urllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,10 +11,10 @@ from typing import Dict, List, Optional, Tuple
 
 import ramalama.go2jinja as go2jinja
 import ramalama.oci
-from ramalama.common import download_file, generate_sha256, verify_checksum
+from ramalama.common import download_file, generate_sha256, perror, verify_checksum
+from ramalama.endian import EndianMismatchError, GGUFEndian
 from ramalama.gguf_parser import GGUFInfoParser, GGUFModelInfo
-
-LOGGER = logging.getLogger(__name__)
+from ramalama.logger import logger
 
 
 def sanitize_filename(filename: str) -> str:
@@ -38,6 +38,7 @@ class SnapshotFile:
         type: SnapshotFileType,
         should_show_progress: bool = False,
         should_verify_checksum: bool = False,
+        should_verify_endianness: bool = True,
         required: bool = True,
     ):
         self.url: str = url
@@ -47,6 +48,7 @@ class SnapshotFile:
         self.type: SnapshotFileType = type
         self.should_show_progress: bool = should_show_progress
         self.should_verify_checksum: bool = should_verify_checksum
+        self.should_verify_endianness: bool = should_verify_endianness
         self.required: bool = required
 
     def download(self, blob_file_path: str, snapshot_dir: str) -> str:
@@ -67,10 +69,19 @@ class LocalSnapshotFile(SnapshotFile):
         type: SnapshotFileType,
         should_show_progress: bool = False,
         should_verify_checksum: bool = False,
+        should_verify_endianness: bool = True,
         required: bool = True,
     ):
         super().__init__(
-            "", "", generate_sha256(content), name, type, should_show_progress, should_verify_checksum, required
+            "",
+            "",
+            generate_sha256(content),
+            name,
+            type,
+            should_show_progress,
+            should_verify_checksum,
+            should_verify_endianness,
+            required,
         )
         self.content = content
 
@@ -205,7 +216,7 @@ class GlobalModelStore:
     def path(self) -> str:
         return self._store_base_path
 
-    def list_models(self, engine: str, debug: bool, show_container: bool) -> Dict[str, List[ModelFile]]:
+    def list_models(self, engine: str, show_container: bool) -> Dict[str, List[ModelFile]]:
         models: Dict[str, List[ModelFile]] = {}
 
         for root, subdirs, _ in os.walk(self.path):
@@ -249,7 +260,6 @@ class GlobalModelStore:
                 dotdict(
                     {
                         "engine": engine,
-                        "debug": debug,
                     }
                 )
             )
@@ -429,6 +439,7 @@ class ModelStore:
         os.makedirs(snapshot_directory, exist_ok=True)
 
     def _download_snapshot_files(self, model_tag: str, snapshot_hash: str, snapshot_files: list[SnapshotFile]):
+        host_endianness = GGUFEndian.LITTLE if sys.byteorder == 'little' else GGUFEndian.BIG
         ref_file = self.get_ref_file(model_tag)
 
         for file in snapshot_files:
@@ -446,11 +457,25 @@ class ModelStore:
 
             if file.should_verify_checksum:
                 if not verify_checksum(dest_path):
-                    LOGGER.info(f"Checksum mismatch for blob {dest_path}, retrying download ...")
+                    logger.info(f"Checksum mismatch for blob {dest_path}, retrying download ...")
                     os.remove(dest_path)
                     file.download(dest_path, self.get_snapshot_directory(snapshot_hash))
                     if not verify_checksum(dest_path):
                         raise ValueError(f"Checksum verification failed for blob {dest_path}")
+
+            if file.should_verify_endianness and GGUFInfoParser.is_model_gguf(dest_path):
+                model_info = GGUFInfoParser.parse("model", "registry", dest_path)
+                if host_endianness != model_info.Endianness:
+                    os.remove(dest_path)
+                    perror()
+                    perror(
+                        f"Failed to pull model: "
+                        f"host endian is {host_endianness} but the model endian is {model_info.Endianness}"
+                    )
+                    perror("Failed to pull model: ramalama currently does not support transparent byteswapping")
+                    raise EndianMismatchError(
+                        f"Unexpected model endianness: wanted {host_endianness}, got {model_info.Endianness}"
+                    )
 
             os.symlink(blob_relative_path, self.get_snapshot_file_path(snapshot_hash, file.name))
 
@@ -477,7 +502,7 @@ class ModelStore:
                     ]
                     self.update_snapshot(model_tag, snapshot_hash, files)
                 except Exception as ex:
-                    LOGGER.debug(f"Failed to convert Go Template to Jinja: {ex}")
+                    logger.debug(f"Failed to convert Go Template to Jinja: {ex}")
                 return
             if file.type == SnapshotFileType.Model:
                 model_file = file
@@ -512,7 +537,7 @@ class ModelStore:
                     LocalSnapshotFile(jinja_template, "chat_template_converted", SnapshotFileType.ChatTemplate)
                 )
             except Exception as ex:
-                LOGGER.debug(f"Failed to convert Go Template to Jinja: {ex}")
+                logger.debug(f"Failed to convert Go Template to Jinja: {ex}")
 
         self.update_snapshot(model_tag, snapshot_hash, files)
 
@@ -553,9 +578,9 @@ class ModelStore:
         try:
             if os.path.exists(blob_path) and Path(self.base_path) in blob_path.parents:
                 os.remove(blob_path)
-                LOGGER.debug(f"Removed blob for '{snapshot_file_path}'")
+                logger.debug(f"Removed blob for '{snapshot_file_path}'")
         except Exception as ex:
-            LOGGER.error(f"Failed to remove blob file '{blob_path}': {ex}")
+            logger.error(f"Failed to remove blob file '{blob_path}': {ex}")
 
     def remove_snapshot(self, model_tag: str):
         ref_file = self.get_ref_file(model_tag)
