@@ -3,7 +3,6 @@
 import glob
 import hashlib
 import json
-import logging
 import os
 import platform
 import random
@@ -17,11 +16,11 @@ import time
 import urllib.error
 from typing import List
 
+import ramalama.amdkfd as amdkfd
 import ramalama.console as console
 from ramalama.http_client import HttpClient
+from ramalama.logger import logger
 from ramalama.version import version
-
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 
 MNT_DIR = "/mnt/models"
 MNT_FILE = f"{MNT_DIR}/model.file"
@@ -36,6 +35,8 @@ HTTP_NOT_FOUND = 404
 HTTP_RANGE_NOT_SATISFIABLE = 416  # "Range Not Satisfiable" error (file already downloaded)
 
 DEFAULT_IMAGE = "quay.io/ramalama/ramalama"
+
+MIN_VRAM_BYTES = 1073741824  # 1GiB
 
 
 _engine = -1  # -1 means cached variable not set yet
@@ -134,9 +135,8 @@ def quoted(arr):
     return " ".join(['"' + element + '"' if ' ' in element else element for element in arr])
 
 
-def exec_cmd(args, debug=False, stdout2null=False, stderr2null=False):
-    if debug:
-        perror("exec_cmd: ", quoted(args))
+def exec_cmd(args, stdout2null=False, stderr2null=False):
+    logger.debug(f"exec_cmd: {quoted(args)}")
 
     if stdout2null:
         with open(os.devnull, 'w') as devnull:
@@ -153,7 +153,7 @@ def exec_cmd(args, debug=False, stdout2null=False, stderr2null=False):
         raise
 
 
-def run_cmd(args, cwd=None, stdout=subprocess.PIPE, ignore_stderr=False, ignore_all=False, debug=False):
+def run_cmd(args, cwd=None, stdout=subprocess.PIPE, ignore_stderr=False, ignore_all=False):
     """
     Run the given command arguments.
 
@@ -163,13 +163,11 @@ def run_cmd(args, cwd=None, stdout=subprocess.PIPE, ignore_stderr=False, ignore_
     stdout: standard output configuration
     ignore_stderr: if True, ignore standard error
     ignore_all: if True, ignore both standard output and standard error
-    debug: if True, print debug information
     """
-    if debug:
-        perror("run_cmd: ", quoted(args))
-        perror(f"Working directory: {cwd}")
-        perror(f"Ignore stderr: {ignore_stderr}")
-        perror(f"Ignore all: {ignore_all}")
+    logger.debug(f"run_cmd: {quoted(args)}")
+    logger.debug(f"Working directory: {cwd}")
+    logger.debug(f"Ignore stderr: {ignore_stderr}")
+    logger.debug(f"Ignore all: {ignore_all}")
 
     serr = None
     if ignore_all or ignore_stderr:
@@ -180,8 +178,7 @@ def run_cmd(args, cwd=None, stdout=subprocess.PIPE, ignore_stderr=False, ignore_
         sout = subprocess.DEVNULL
 
     result = subprocess.run(args, check=True, cwd=cwd, stdout=sout, stderr=serr)
-    if debug:
-        print("Command finished with return code:", result.returncode)
+    logger.debug(f"Command finished with return code: {result.returncode}")
 
     return result
 
@@ -453,12 +450,24 @@ def check_ascend():
 def check_rocm_amd():
     gpu_num = 0
     gpu_bytes = 0
-    for i, fp in enumerate(sorted(glob.glob('/sys/bus/pci/devices/*/mem_info_vram_total'))):
-        with open(fp, 'r') as file:
-            content = int(file.read())
-            if content > 1073741824 and content > gpu_bytes:
-                gpu_bytes = content
-                gpu_num = i
+    for i, (np, props) in enumerate(amdkfd.gpus()):
+        # Radeon GPUs older than gfx900 are not supported by ROCm (e.g. Polaris)
+        if props['gfx_target_version'] < 90000:
+            continue
+
+        mem_banks_count = int(props['mem_banks_count'])
+        mem_bytes = 0
+        for bank in range(mem_banks_count):
+            bank_props = amdkfd.parse_props(np + f'/mem_banks/{bank}/properties')
+            # See /usr/include/linux/kfd_sysfs.h for possible heap types
+            #
+            # Count public and private framebuffer memory as VRAM
+            if bank_props['heap_type'] in [amdkfd.HEAP_TYPE_FB_PUBLIC, amdkfd.HEAP_TYPE_FB_PRIVATE]:
+                mem_bytes += int(bank_props['size_in_bytes'])
+
+        if mem_bytes > MIN_VRAM_BYTES and mem_bytes > gpu_bytes:
+            gpu_bytes = mem_bytes
+            gpu_num = i
 
     if gpu_bytes:
         os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_num)
@@ -473,6 +482,8 @@ def check_intel():
     intel_gpus = (
         b"0xe20b",
         b"0xe20c",
+        b"0x56a0",
+        b"0x56a1",
         b"0x7d51",
         b"0x7dd5",
         b"0x7d55",
@@ -532,19 +543,40 @@ def set_accel_env_vars():
     get_accel()
 
 
-def get_accel_env_vars():
+def set_gpu_type_env_vars():
+    if get_gpu_type_env_vars():
+        return
+
+    get_accel()
+
+
+def get_gpu_type_env_vars():
     gpu_vars = (
         "ASAHI_VISIBLE_DEVICES",
         "ASCEND_VISIBLE_DEVICES",
         "CUDA_VISIBLE_DEVICES",
-        "CUDA_LAUNCH_BLOCKING",
         "HIP_VISIBLE_DEVICES",
-        "HSA_VISIBLE_DEVICES",
-        "HSA_OVERRIDE_GFX_VERSION",
         "INTEL_VISIBLE_DEVICES",
         "MUSA_VISIBLE_DEVICES",
     )
     env_vars = {k: v for k, v in os.environ.items() for gpu_var in gpu_vars if k == gpu_var}
+
+    return env_vars
+
+
+def get_accel_env_vars():
+    # Start with GPU type env vars
+    env_vars = get_gpu_type_env_vars()
+
+    # Add other accelerator-specific vars
+    accel_vars = (
+        "CUDA_LAUNCH_BLOCKING",
+        "HSA_VISIBLE_DEVICES",
+        "HSA_OVERRIDE_GFX_VERSION",
+    )
+    for k in accel_vars:
+        if k in os.environ:
+            env_vars[k] = os.environ[k]
 
     return env_vars
 
@@ -633,29 +665,40 @@ def select_cuda_image(config):
         raise RuntimeError(f"CUDA version {cuda_version} is not supported. Minimum required version is 12.4.")
 
 
-def accel_image(config, args):
-    if args and args.image and len(args.image.split(":")) > 1:
+def resolve_image_from_args_and_env(config, args):
+    """
+    Resolves the base image based on arguments, environment variables, and config.
+    Returns the resolved image string, or None if not found.
+    """
+    if args and getattr(args, "image", None) and len(args.image.split(":")) > 1:
         return args.image
-
-    if hasattr(args, 'image_override'):
-        return tagged_image(args.image)
 
     image = os.getenv("RAMALAMA_IMAGE")
     if image:
         return tagged_image(image)
 
-    if config.is_set('image'):
-        return tagged_image(config['image'])
+    if config.is_set("image"):
+        return tagged_image(config["image"])
+
+    return None  # Defer to the next function for more advanced logic
+
+
+def accel_image(config, args):
+    """
+    Selects and the appropriate image based on config, arguments, environment.
+    """
+    # Try to resolve using args/environment/config
+    image = resolve_image_from_args_and_env(config, args)
+    if image:
+        return image
 
     conman = config['engine']
     images = config['images']
-    set_accel_env_vars()
-    env_vars = get_accel_env_vars()
-
-    if not env_vars:
-        gpu_type = None
+    set_gpu_type_env_vars()
+    if gpu_type_env_vars := get_gpu_type_env_vars():
+        gpu_type, _ = next(iter(gpu_type_env_vars.items()))
     else:
-        gpu_type, _ = next(iter(env_vars.items()))
+        gpu_type = None
 
     # Get image based on detected GPU type
     image = images.get(gpu_type, config["image"])
@@ -675,16 +718,16 @@ def accel_image(config, args):
         image += "-rag"
 
     vers = minor_release()
-    if args.container and attempt_to_use_versioned(conman, image, vers, args.quiet, args.debug):
+    if args.container and attempt_to_use_versioned(conman, image, vers, args.quiet):
         return f"{image}:{vers}"
 
     return f"{image}:latest"
 
 
-def attempt_to_use_versioned(conman, image, vers, quiet, debug):
+def attempt_to_use_versioned(conman, image, vers, quiet):
     try:
         # check if versioned image exists locally
-        if run_cmd([conman, "inspect", f"{image}:{vers}"], ignore_all=True, debug=debug):
+        if run_cmd([conman, "inspect", f"{image}:{vers}"], ignore_all=True):
             return True
 
     except Exception:
@@ -694,7 +737,7 @@ def attempt_to_use_versioned(conman, image, vers, quiet, debug):
         # attempt to pull the versioned image
         if not quiet:
             print(f"Attempting to pull {image}:{vers} ...")
-        run_cmd([conman, "pull", f"{image}:{vers}"], ignore_stderr=True, debug=debug)
+        run_cmd([conman, "pull", f"{image}:{vers}"], ignore_stderr=True)
         return True
 
     except Exception:

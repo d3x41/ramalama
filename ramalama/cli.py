@@ -24,11 +24,13 @@ import ramalama.rag
 from ramalama import engine
 from ramalama.common import accel_image, exec_cmd, get_accel, get_cmd_with_wrapper, perror
 from ramalama.config import CONFIG
+from ramalama.logger import configure_logger, logger
 from ramalama.migrate import ModelStoreImport
 from ramalama.model import MODEL_TYPES
-from ramalama.model_factory import ModelFactory
+from ramalama.model_factory import ModelFactory, New
 from ramalama.model_store import GlobalModelStore
 from ramalama.shortnames import Shortnames
+from ramalama.stack import Stack
 from ramalama.version import print_version, version
 
 shortnames = Shortnames()
@@ -270,6 +272,8 @@ def post_parse_setup(args):
     if hasattr(args, "runtime_args"):
         args.runtime_args = shlex.split(args.runtime_args)
 
+    configure_logger("DEBUG" if args.debug else "WARNING")
+
 
 def login_parser(subparsers):
     parser = subparsers.add_parser("login", help="login to remote registry")
@@ -433,7 +437,10 @@ def info_parser(subparsers):
 
 
 def list_parser(subparsers):
-    parser = subparsers.add_parser("list", aliases=["ls"], help="list all downloaded AI Models")
+    parser = subparsers.add_parser(
+        "list", aliases=["ls"], help="list all downloaded AI Models (excluding partially downloaded ones)"
+    )
+    parser.add_argument("--all", dest="all", action="store_true", help="include partially downloaded AI Models")
     parser.add_argument("--json", dest="json", action="store_true", help="print using json")
     parser.add_argument("-n", "--noheading", dest="noheading", action="store_true", help="do not display heading")
     parser.set_defaults(func=list_cli)
@@ -462,29 +469,43 @@ def get_size(path):
     return os.path.getsize(path)
 
 
+def _list_models_from_store(args):
+    models = GlobalModelStore(args.store).list_models(engine=args.engine, show_container=args.container)
+
+    ret = []
+    local_timezone = datetime.now().astimezone().tzinfo
+
+    for model, files in models.items():
+        is_partially_downloaded = any(file.is_partial for file in files)
+        if not args.all and is_partially_downloaded:
+            continue
+
+        if model.startswith("huggingface://"):
+            model = model.replace("huggingface://", "hf://", 1)
+            model = model.removesuffix(":latest")
+
+        size_sum = 0
+        last_modified = 0.0
+        for file in files:
+            size_sum += file.size
+            last_modified = max(file.modified, last_modified)
+
+        ret.append(
+            {
+                "name": f"{model} (partial)" if is_partially_downloaded else model,
+                "modified": datetime.fromtimestamp(last_modified, tz=local_timezone).isoformat(),
+                "size": size_sum,
+            }
+        )
+
+    return ret
+
+
 def _list_models(args):
     mycwd = os.getcwd()
     if args.use_model_store:
-        models = GlobalModelStore(args.store).list_models(
-            engine=args.engine, debug=args.debug, show_container=args.container
-        )
-        ret = []
-        local_timezone = datetime.now().astimezone().tzinfo
+        return _list_models_from_store(args)
 
-        for model, files in models.items():
-            size_sum = 0
-            last_modified = 0.0
-            for file in files:
-                size_sum += file.size
-                last_modified = max(file.modified, last_modified)
-            ret.append(
-                {
-                    "name": model,
-                    "modified": datetime.fromtimestamp(last_modified, tz=local_timezone).isoformat(),
-                    "size": size_sum,
-                }
-            )
-        return ret
     os.chdir(f"{args.store}/models/")
     models = []
 
@@ -650,13 +671,13 @@ def convert_cli(args):
         raise ValueError("convert command cannot be run with the --nocontainer option.")
 
     target = args.TARGET
-    source_model = _get_source_model(args)
-
     tgt = shortnames.resolve(target)
     if not tgt:
         tgt = target
 
     model = ModelFactory(tgt, args).create_oci()
+
+    source_model = _get_source_model(args)
     model.convert(source_model, args)
 
 
@@ -726,12 +747,18 @@ def push_cli(args):
             m = ModelFactory(target, args).create_oci()
             m.push(source_model, args)
         except Exception as e1:
-            if args.debug:
-                print(e1)
+            logger.debug(e1)
             raise e
 
 
 def runtime_options(parser, command):
+    if command in ["run", "serve"]:
+        parser.add_argument(
+            "--api",
+            default=CONFIG["api"],
+            choices=["llama-stack", "none"],
+            help="unified API layer for for Inference, RAG, Agents, Tools, Safety, Evals, and Telemetry.",
+        )
     parser.add_argument("--authfile", help="path of the authentication file")
     if command in ["run", "perplexity", "serve"]:
         parser.add_argument(
@@ -937,6 +964,13 @@ def serve_cli(args):
     if args.rag:
         _get_rag(args)
 
+    if args.api == "llama-stack":
+        if not args.container:
+            raise ValueError("ramalama serve --api llama-stack command cannot be run with the --nocontainer option.")
+
+        stack = Stack(args)
+        return stack.serve()
+
     try:
         model = New(args.MODEL, args)
         model.serve(args)
@@ -1079,15 +1113,9 @@ def rm_cli(args):
     if len(args.MODEL) > 0:
         raise IndexError("can not specify --all as well MODEL")
 
-    models = GlobalModelStore(args.store).list_models(
-        engine=args.engine, debug=args.debug, show_container=args.container
-    )
+    models = GlobalModelStore(args.store).list_models(engine=args.engine, show_container=args.container)
 
     return _rm_model([model for model in models.keys()], args)
-
-
-def New(model, args, transport=CONFIG["transport"]):
-    return ModelFactory(model, args, transport=transport).create()
 
 
 def client_cli(args):

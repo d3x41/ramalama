@@ -1,4 +1,3 @@
-import logging
 import os
 import shutil
 import urllib
@@ -11,10 +10,10 @@ from typing import Dict, List, Optional, Tuple
 
 import ramalama.go2jinja as go2jinja
 import ramalama.oci
-from ramalama.common import download_file, generate_sha256, verify_checksum
+from ramalama.common import download_file, generate_sha256, perror, verify_checksum
+from ramalama.endian import EndianMismatchError, get_system_endianness
 from ramalama.gguf_parser import GGUFInfoParser, GGUFModelInfo
-
-LOGGER = logging.getLogger(__name__)
+from ramalama.logger import logger
 
 
 def sanitize_filename(filename: str) -> str:
@@ -70,7 +69,14 @@ class LocalSnapshotFile(SnapshotFile):
         required: bool = True,
     ):
         super().__init__(
-            "", "", generate_sha256(content), name, type, should_show_progress, should_verify_checksum, required
+            "",
+            "",
+            generate_sha256(content),
+            name,
+            type,
+            should_show_progress,
+            should_verify_checksum,
+            required,
         )
         self.content = content
 
@@ -205,7 +211,7 @@ class GlobalModelStore:
     def path(self) -> str:
         return self._store_base_path
 
-    def list_models(self, engine: str, debug: bool, show_container: bool) -> Dict[str, List[ModelFile]]:
+    def list_models(self, engine: str, show_container: bool) -> Dict[str, List[ModelFile]]:
         models: Dict[str, List[ModelFile]] = {}
 
         for root, subdirs, _ in os.walk(self.path):
@@ -231,11 +237,9 @@ class GlobalModelStore:
                             )
                             if not os.path.exists(blobs_partial_file_path):
                                 continue
-                            snapshot_file_path = blobs_partial_file_path
 
-                            # append indication for partial downloaded model
-                            if not model_name.endswith("(partial)"):
-                                is_partially_downloaded = True
+                            snapshot_file_path = blobs_partial_file_path
+                            is_partially_downloaded = True
 
                         last_modified = os.path.getmtime(snapshot_file_path)
                         file_size = os.path.getsize(snapshot_file_path)
@@ -249,7 +253,6 @@ class GlobalModelStore:
                 dotdict(
                     {
                         "engine": engine,
-                        "debug": debug,
                     }
                 )
             )
@@ -446,7 +449,7 @@ class ModelStore:
 
             if file.should_verify_checksum:
                 if not verify_checksum(dest_path):
-                    LOGGER.info(f"Checksum mismatch for blob {dest_path}, retrying download ...")
+                    logger.info(f"Checksum mismatch for blob {dest_path}, retrying download ...")
                     os.remove(dest_path)
                     file.download(dest_path, self.get_snapshot_directory(snapshot_hash))
                     if not verify_checksum(dest_path):
@@ -477,7 +480,7 @@ class ModelStore:
                     ]
                     self.update_snapshot(model_tag, snapshot_hash, files)
                 except Exception as ex:
-                    LOGGER.debug(f"Failed to convert Go Template to Jinja: {ex}")
+                    logger.debug(f"Failed to convert Go Template to Jinja: {ex}")
                 return
             if file.type == SnapshotFileType.Model:
                 model_file = file
@@ -512,15 +515,56 @@ class ModelStore:
                     LocalSnapshotFile(jinja_template, "chat_template_converted", SnapshotFileType.ChatTemplate)
                 )
             except Exception as ex:
-                LOGGER.debug(f"Failed to convert Go Template to Jinja: {ex}")
+                logger.debug(f"Failed to convert Go Template to Jinja: {ex}")
 
         self.update_snapshot(model_tag, snapshot_hash, files)
 
+    def _verify_endianness(self, model_tag: str):
+        ref_file = self.get_ref_file(model_tag)
+        if ref_file is None:
+            return
+
+        model_hash = self.get_blob_file_hash(ref_file.hash, ref_file.model_name)
+        model_path = self.get_blob_file_path(model_hash)
+
+        # only check endianness for gguf models
+        if not GGUFInfoParser.is_model_gguf(model_path):
+            return
+
+        model_endianness = GGUFInfoParser.get_model_endianness(model_path)
+        host_endianness = get_system_endianness()
+        if host_endianness != model_endianness:
+            raise EndianMismatchError(host_endianness, model_endianness)
+
+    def verify_snapshot(self, model_tag: str):
+        self._verify_endianness(model_tag)
+        self._store.verify_snapshot()
+
     def new_snapshot(self, model_tag: str, snapshot_hash: str, snapshot_files: list[SnapshotFile]):
         snapshot_hash = sanitize_filename(snapshot_hash)
-        self._prepare_new_snapshot(model_tag, snapshot_hash, snapshot_files)
-        self._download_snapshot_files(model_tag, snapshot_hash, snapshot_files)
-        self._ensure_chat_template(model_tag, snapshot_hash, snapshot_files)
+
+        try:
+            self._prepare_new_snapshot(model_tag, snapshot_hash, snapshot_files)
+            self._download_snapshot_files(model_tag, snapshot_hash, snapshot_files)
+            self._ensure_chat_template(model_tag, snapshot_hash, snapshot_files)
+        except urllib.error.HTTPError as ex:
+            perror(f"Failed to fetch required file: {ex}")
+            perror("Removing snapshot...")
+            self.remove_snapshot(model_tag)
+            raise ex
+        except Exception as ex:
+            perror(f"Failed to create new snapshot: {ex}")
+            perror("Removing snapshot...")
+            self.remove_snapshot(model_tag)
+            raise ex
+
+        try:
+            self.verify_snapshot(model_tag)
+        except EndianMismatchError as ex:
+            perror(f"Verification of snapshot failed: {ex}")
+            perror("Removing snapshot...")
+            self.remove_snapshot(model_tag)
+            raise ex
 
     def update_snapshot(self, model_tag: str, snapshot_hash: str, new_snapshot_files: list[SnapshotFile]) -> bool:
         validate_snapshot_files(new_snapshot_files)
@@ -553,9 +597,9 @@ class ModelStore:
         try:
             if os.path.exists(blob_path) and Path(self.base_path) in blob_path.parents:
                 os.remove(blob_path)
-                LOGGER.debug(f"Removed blob for '{snapshot_file_path}'")
+                logger.debug(f"Removed blob for '{snapshot_file_path}'")
         except Exception as ex:
-            LOGGER.error(f"Failed to remove blob file '{blob_path}': {ex}")
+            logger.error(f"Failed to remove blob file '{blob_path}': {ex}")
 
     def remove_snapshot(self, model_tag: str):
         ref_file = self.get_ref_file(model_tag)
@@ -568,8 +612,11 @@ class ModelStore:
 
         # Remove snapshot directory
         snapshot_directory = self.get_snapshot_directory_from_tag(model_tag)
-        shutil.rmtree(snapshot_directory, ignore_errors=False)
+        shutil.rmtree(snapshot_directory, ignore_errors=True)
 
-        # Remove ref file
+        # Remove ref file, ignore if file is not found
         ref_file_path = self.get_ref_file_path(model_tag)
-        os.remove(ref_file_path)
+        try:
+            os.remove(ref_file_path)
+        except FileNotFoundError:
+            pass

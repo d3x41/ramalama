@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
-import atexit
 import os
 import signal
-import subprocess
 import sys
-from argparse import Namespace
 
 
 def initialize_parser():
@@ -34,11 +31,11 @@ def initialize_parser():
         "-t",
         "--threads",
         type=int,
-        help=f"number of cpu threads to use",
+        help="number of cpu threads to use",
     )
     parser.add_argument(
         "-v",
-        help=f"verbose",
+        help="verbose",
         action="store_true",
     )
     parser.add_argument("MODEL", type=str, help="Path to the model")  # positional argument
@@ -54,14 +51,30 @@ def initialize_args():
 
     parser = initialize_parser()
     parsed_args = parser.parse_args()
-    port = get_available_port_if_any(False)
+    port = get_available_port_if_any()
 
     return parsed_args, port
 
 
 def main(args):
+    # This logic ensures that for internal HTTP calls (to 127.0.0.1), the system's proxy settings are bypassed.
+    no_proxy_essentials = {"localhost", "127.0.0.1"}
+
+    current_no_proxy_upper = os.environ.get('NO_PROXY', '')
+    existing_parts_upper = set(part.strip() for part in current_no_proxy_upper.split(',') if part.strip())
+    final_no_proxy_parts_upper = existing_parts_upper.union(no_proxy_essentials)
+    os.environ['NO_PROXY'] = ",".join(sorted(list(final_no_proxy_parts_upper)))
+
+    current_no_proxy_lower = os.environ.get('no_proxy', '')
+    existing_parts_lower = set(part.strip() for part in current_no_proxy_lower.split(',') if part.strip())
+    final_no_proxy_parts_lower = existing_parts_lower.union(no_proxy_essentials)
+    os.environ['no_proxy'] = ",".join(sorted(list(final_no_proxy_parts_lower)))
+
+    for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
+        if proxy_var in os.environ:
+            del os.environ[proxy_var]
+
     sys.path.append('./')
-    from ramalama.cli import serve_cli
     from ramalama.common import exec_cmd
 
     parsed_args, port = initialize_args()
@@ -71,15 +84,39 @@ def main(args):
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
         # at this point we are already in a container so, --nocontainer always makes sense
         dont_print_output = (not parsed_args.debug) and (not parsed_args.v)
-        exec_cmd(["ramalama", "--nocontainer", "serve", "--threads", str(parsed_args.threads), "--temp", parsed_args.temp, "--port", str(port), parsed_args.MODEL], stdout2null=dont_print_output, stderr2null=dont_print_output)
+        exec_cmd(
+            [
+                "ramalama",
+                "--nocontainer",
+                "serve",
+                "--threads",
+                str(parsed_args.threads),
+                "--temp",
+                parsed_args.temp,
+                "--port",
+                str(port),
+                parsed_args.MODEL,
+            ],
+            stdout2null=dont_print_output,
+            stderr2null=dont_print_output,
+        )
 
         return 0
 
     client_args = build_args(args, "ramalama-client-core")
-    client_args += ['-c', parsed_args.context, '--temp', parsed_args.temp, "--kill-server", str(pid), "http://127.0.0.1:" + str(port)] + parsed_args.ARGS
+    client_args += [
+        '-c',
+        parsed_args.context,
+        '--temp',
+        parsed_args.temp,
+        "--kill-server",
+        str(pid),
+        "http://127.0.0.1:" + str(port),
+    ] + parsed_args.ARGS
     exec_cmd(client_args)
 
     return 0
+
 
 def build_args(args, new_command):
     new_args = args.copy()
@@ -87,6 +124,7 @@ def build_args(args, new_command):
     new_args = [new_args[0]]
 
     return new_args
+
 
 if __name__ == "__main__":
     main(sys.argv)
