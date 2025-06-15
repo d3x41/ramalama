@@ -1,4 +1,5 @@
 import socket
+from argparse import Namespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -76,6 +77,7 @@ ms_granite_blob = "https://modelscope.cn/models/ibm-granite/granite-3b-code-base
 )
 def test_extract_model_identifiers(model_input: str, expected_name: str, expected_tag: str, expected_orga: str):
     args = ARGS()
+    args.engine = "podman"
     name, tag, orga = ModelFactory(model_input, args).create().extract_model_identifiers()
     assert name == expected_name
     assert tag == expected_tag
@@ -114,6 +116,7 @@ def test_extract_model_identifiers(model_input: str, expected_name: str, expecte
 def test_compute_serving_port(
     inputPort: str, expectedRandomizedResult: list, expectedRandomPortsAvl: list, expectedOutput: str, expectedErr
 ):
+    args = Namespace(port=inputPort, debug=False, api="")
     mock_socket = socket.socket
     mock_socket.bind = MagicMock(side_effect=expectedRandomPortsAvl)
     mock_compute_ports = Mock(return_value=expectedRandomizedResult)
@@ -122,8 +125,8 @@ def test_compute_serving_port(
         with patch('socket.socket', mock_socket):
             if expectedErr:
                 with pytest.raises(expectedErr):
-                    outputPort = compute_serving_port(inputPort, False)
+                    outputPort = compute_serving_port(args, False)
                     assert outputPort == expectedOutput
             else:
-                outputPort = compute_serving_port(inputPort, False)
+                outputPort = compute_serving_port(args, False)
                 assert outputPort == expectedOutput

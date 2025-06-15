@@ -26,6 +26,7 @@ from ramalama.console import EMOJI
 from ramalama.engine import Engine, dry_run
 from ramalama.gguf_parser import GGUFInfoParser
 from ramalama.kube import Kube
+from ramalama.logger import logger
 from ramalama.model_inspect import GGUFModelInfo, ModelInfoBase
 from ramalama.model_store import ModelStore
 from ramalama.quadlet import Quadlet
@@ -47,6 +48,11 @@ RamaLama requires the server application be installed in the container images.
 Either install a package containing the "%(cmd)s" command in the container or run
 with the default RamaLama
 $(error)s"""
+
+
+def should_colorize():
+    t = os.getenv("TERM")
+    return t and t != "dumb" and sys.stdout.isatty()
 
 
 def is_split_file_model(model_path):
@@ -178,11 +184,12 @@ class Model(ModelBase):
     def remove(self, args):
         if self.store is not None:
             _, tag, _ = self.extract_model_identifiers()
-            try:
+            if self.store.tag_exists(tag):
                 self.store.remove_snapshot(tag)
-            except OSError as e:
-                if not args.ignore:
-                    raise KeyError(f"removing {self.model}: {e}")
+                return
+
+            if not args.ignore:
+                raise KeyError(f"Model '{self.model}' not found")
             return
 
         model_path = self.model_path(args)
@@ -207,9 +214,11 @@ class Model(ModelBase):
             args.image = args.image.split(":")[0]
         args.image = accel_image(CONFIG, args)
         self.engine = Engine(args)
+        if args.subcommand == "run" and not (hasattr(args, "ARGS") and args.ARGS) and sys.stdin.isatty():
+            self.engine.add(["-i"])
+
         self.engine.add(
             [
-                "-i",
                 "--label",
                 "ai.ramalama",
                 "--name",
@@ -248,7 +257,6 @@ class Model(ModelBase):
     def setup_container(self, args):
         name = self.get_container_name(args)
         self.base(args, name)
-        self.engine.add_container_labels()
 
     def gpu_args(self, args, runner=False):
         gpu_args = []
@@ -291,6 +299,9 @@ class Model(ModelBase):
         self.setup_container(args)
         self.setup_mounts(model_path, args)
         self.handle_rag_mode(args, cmd_args)
+
+        # Make sure Image precedes cmd_args
+        self.engine.add([accel_image(CONFIG, args)] + cmd_args)
 
         if args.dryrun:
             self.engine.dryrun()
@@ -338,9 +349,6 @@ class Model(ModelBase):
         # so that accel_image will add -rag to the image specification.
         if hasattr(args, "rag") and args.rag:
             args.image = args.image.split(":")[0]
-
-        # Make sure Image precedes cmd_args
-        self.engine.add([accel_image(CONFIG, args)] + cmd_args)
 
     def bench(self, args):
         model_path = self.get_model_path(args)
@@ -524,11 +532,14 @@ class Model(ModelBase):
                 draft_model = self.draft_model.get_model_path(args)
                 draft_model_path = MNT_FILE_DRAFT if args.container or args.generate else draft_model
 
-            exec_args += ["llama-server", "--port", args.port, "--model", exec_model_path]
+            exec_args += ["llama-server", "--port", args.port, "--model", exec_model_path, "--no-warmup"]
             if mmproj_path:
                 exec_args += ["--mmproj", mmproj_path]
             else:
                 exec_args += ["--jinja"]
+
+            if should_colorize():
+                exec_args += ["--log-colors"]
 
             exec_args += [
                 "--alias",
@@ -606,7 +617,7 @@ class Model(ModelBase):
             if args.dryrun:
                 dry_run(exec_args)
                 return
-            exec_cmd(exec_args, debug=args.debug)
+            exec_cmd(exec_args)
         except FileNotFoundError as e:
             if args.container:
                 raise NotImplementedError(
@@ -616,13 +627,13 @@ class Model(ModelBase):
 
     def serve(self, args, quiet=False):
         self.validate_args(args)
-        args.port = compute_serving_port(args.port, args.debug, quiet)
         model_path = self.get_model_path(args)
         if is_split_file_model(model_path):
             mnt_file = MNT_DIR + '/' + self.mnt_path
         else:
             mnt_file = MNT_FILE
 
+        args.port = compute_serving_port(args, quiet=quiet or args.generate)
         exec_model_path = mnt_file if args.container or args.generate else model_path
         chat_template_path = ""
         mmproj_path = ""
@@ -713,13 +724,12 @@ def compute_ports() -> list:
     return [first_port] + ports
 
 
-def get_available_port_if_any(debug: bool) -> int:
+def get_available_port_if_any() -> int:
     ports = compute_ports()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         chosen_port = 0
         for target_port in ports:
-            if debug:
-                print(f"Checking if {target_port} is available")
+            logger.debug(f"Checking if {target_port} is available")
             try:
                 s.bind(('localhost', target_port))
             except OSError:
@@ -730,16 +740,20 @@ def get_available_port_if_any(debug: bool) -> int:
         return chosen_port
 
 
-def compute_serving_port(port: str, debug: bool, quiet=False) -> str:
+def compute_serving_port(args, quiet=False) -> str:
     # user probably specified a custom port, don't override the choice
-    if port != "" and port != str(DEFAULT_PORT):
-        return port
-
-    # otherwise compute a random serving port in the range
-    target_port = get_available_port_if_any(debug)
+    if args.port not in ["", str(DEFAULT_PORT)]:
+        target_port = args.port
+    else:
+        # otherwise compute a random serving port in the range
+        target_port = get_available_port_if_any()
 
     if target_port == 0:
         raise IOError("no available port could be detected. Please ensure you have enough free ports.")
     if not quiet:
-        print(f"serving on port {target_port}")
+        openai = f"http://localhost:{target_port}"
+        if args.api == "llama-stack":
+            print(f"Llama Stack RESTAPI: {openai}")
+            openai = openai + "/v1/openai"
+            print(f"OpenAI RESTAPI: {openai}")
     return str(target_port)

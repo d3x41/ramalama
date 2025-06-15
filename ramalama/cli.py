@@ -6,7 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
-import urllib
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,13 +22,16 @@ except Exception:
 import ramalama.oci
 import ramalama.rag
 from ramalama import engine
+from ramalama.chat import RamaLamaShell, default_prefix
 from ramalama.common import accel_image, exec_cmd, get_accel, get_cmd_with_wrapper, perror
 from ramalama.config import CONFIG
+from ramalama.logger import configure_logger, logger
 from ramalama.migrate import ModelStoreImport
 from ramalama.model import MODEL_TYPES
-from ramalama.model_factory import ModelFactory
+from ramalama.model_factory import ModelFactory, New
 from ramalama.model_store import GlobalModelStore
 from ramalama.shortnames import Shortnames
+from ramalama.stack import Stack
 from ramalama.version import print_version, version
 
 shortnames = Shortnames()
@@ -145,7 +148,7 @@ with software on the local system.
 """
 
 
-def create_argument_parser(description):
+def create_argument_parser(description: str):
     """Create and configure the argument parser for the CLI."""
     parser = ArgumentParserWithDefaults(
         prog="ramalama",
@@ -162,7 +165,7 @@ def configure_arguments(parser):
     parser.add_argument(
         "--container",
         dest="container",
-        default=CONFIG["container"],
+        default=CONFIG.container,
         action="store_true",
         help="""run RamaLama in the default container.
 The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
@@ -182,7 +185,7 @@ The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
     parser.add_argument(
         "--engine",
         dest="engine",
-        default=CONFIG["engine"],
+        default=CONFIG.engine,
         help="""run RamaLama using the specified container engine.
 The RAMALAMA_CONTAINER_ENGINE environment variable modifies default behaviour.""",
     )
@@ -196,7 +199,7 @@ The RAMALAMA_CONTAINER_ENGINE environment variable modifies default behaviour.""
     parser.add_argument(
         "--keep-groups",
         dest="podman_keep_groups",
-        default=CONFIG["keep_groups"],
+        default=CONFIG.keep_groups,
         action="store_true",
         help="""pass `--group-add keep-groups` to podman, if using podman.
 Needed to access gpu on some systems, but has security implications.""",
@@ -204,7 +207,7 @@ Needed to access gpu on some systems, but has security implications.""",
     parser.add_argument(
         "--nocontainer",
         dest="container",
-        default=CONFIG["nocontainer"],
+        default=CONFIG.nocontainer,
         action="store_false",
         help="""do not run RamaLama in the default container.
 The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
@@ -212,19 +215,19 @@ The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
     verbosity_group.add_argument("--quiet", "-q", dest="quiet", action="store_true", help="reduce output.")
     parser.add_argument(
         "--runtime",
-        default=CONFIG["runtime"],
+        default=CONFIG.runtime,
         choices=["llama.cpp", "vllm"],
         help="specify the runtime to use; valid options are 'llama.cpp' and 'vllm'",
     )
     parser.add_argument(
         "--store",
-        default=CONFIG["store"],
+        default=CONFIG.store,
         help="store AI Models in the specified directory",
     )
     parser.add_argument(
         "--use-model-store",
         dest="use_model_store",
-        default=CONFIG["use_model_store"],
+        default=CONFIG.use_model_store,
         action="store_true",
         help="use the model store feature",
     )
@@ -235,6 +238,7 @@ def configure_subcommands(parser):
     subparsers = parser.add_subparsers(dest="subcommand")
     subparsers.required = False
     bench_parser(subparsers)
+    chat_parser(subparsers)
     client_parser(subparsers)
     containers_parser(subparsers)
     convert_parser(subparsers)
@@ -270,6 +274,8 @@ def post_parse_setup(args):
     if hasattr(args, "runtime_args"):
         args.runtime_args = shlex.split(args.runtime_args)
 
+    configure_logger("DEBUG" if args.debug else "WARNING")
+
 
 def login_parser(subparsers):
     parser = subparsers.add_parser("login", help="login to remote registry")
@@ -293,8 +299,7 @@ def login_parser(subparsers):
 
 
 def normalize_registry(registry):
-    # Determine the registry to use. Check the value of `RAMALAMA_TRANSPORT` env var if no `registry` argument is set.
-    registry = registry or os.getenv("RAMALAMA_TRANSPORT") or CONFIG['transport']
+    registry = registry or CONFIG.transport
 
     if not registry or registry == "" or registry.startswith("oci://"):
         return "oci://"
@@ -433,7 +438,10 @@ def info_parser(subparsers):
 
 
 def list_parser(subparsers):
-    parser = subparsers.add_parser("list", aliases=["ls"], help="list all downloaded AI Models")
+    parser = subparsers.add_parser(
+        "list", aliases=["ls"], help="list all downloaded AI Models (excluding partially downloaded ones)"
+    )
+    parser.add_argument("--all", dest="all", action="store_true", help="include partially downloaded AI Models")
     parser.add_argument("--json", dest="json", action="store_true", help="print using json")
     parser.add_argument("-n", "--noheading", dest="noheading", action="store_true", help="do not display heading")
     parser.set_defaults(func=list_cli)
@@ -462,29 +470,43 @@ def get_size(path):
     return os.path.getsize(path)
 
 
+def _list_models_from_store(args):
+    models = GlobalModelStore(args.store).list_models(engine=args.engine, show_container=args.container)
+
+    ret = []
+    local_timezone = datetime.now().astimezone().tzinfo
+
+    for model, files in models.items():
+        is_partially_downloaded = any(file.is_partial for file in files)
+        if not args.all and is_partially_downloaded:
+            continue
+
+        if model.startswith("huggingface://"):
+            model = model.replace("huggingface://", "hf://", 1)
+            model = model.removesuffix(":latest")
+
+        size_sum = 0
+        last_modified = 0.0
+        for file in files:
+            size_sum += file.size
+            last_modified = max(file.modified, last_modified)
+
+        ret.append(
+            {
+                "name": f"{model} (partial)" if is_partially_downloaded else model,
+                "modified": datetime.fromtimestamp(last_modified, tz=local_timezone).isoformat(),
+                "size": size_sum,
+            }
+        )
+
+    return ret
+
+
 def _list_models(args):
     mycwd = os.getcwd()
     if args.use_model_store:
-        models = GlobalModelStore(args.store).list_models(
-            engine=args.engine, debug=args.debug, show_container=args.container
-        )
-        ret = []
-        local_timezone = datetime.now().astimezone().tzinfo
+        return _list_models_from_store(args)
 
-        for model, files in models.items():
-            size_sum = 0
-            last_modified = 0.0
-            for file in files:
-                size_sum += file.size
-                last_modified = max(file.modified, last_modified)
-            ret.append(
-                {
-                    "name": model,
-                    "modified": datetime.fromtimestamp(last_modified, tz=local_timezone).isoformat(),
-                    "size": size_sum,
-                }
-            )
-        return ret
     os.chdir(f"{args.store}/models/")
     models = []
 
@@ -608,7 +630,7 @@ def convert_parser(subparsers):
     )
     parser.add_argument(
         "--carimage",
-        default=CONFIG['carimage'],
+        default=CONFIG.carimage,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -650,13 +672,13 @@ def convert_cli(args):
         raise ValueError("convert command cannot be run with the --nocontainer option.")
 
     target = args.TARGET
-    source_model = _get_source_model(args)
-
     tgt = shortnames.resolve(target)
     if not tgt:
         tgt = target
 
     model = ModelFactory(tgt, args).create_oci()
+
+    source_model = _get_source_model(args)
     model.convert(source_model, args)
 
 
@@ -669,7 +691,7 @@ def push_parser(subparsers):
     parser.add_argument("--authfile", help="path of the authentication file")
     parser.add_argument(
         "--carimage",
-        default=CONFIG['carimage'],
+        default=CONFIG.carimage,
         help=argparse.SUPPRESS,
     )
     add_network_argument(parser)
@@ -726,19 +748,25 @@ def push_cli(args):
             m = ModelFactory(target, args).create_oci()
             m.push(source_model, args)
         except Exception as e1:
-            if args.debug:
-                print(e1)
+            logger.debug(e1)
             raise e
 
 
 def runtime_options(parser, command):
+    if command in ["run", "serve"]:
+        parser.add_argument(
+            "--api",
+            default=CONFIG.api,
+            choices=["llama-stack", "none"],
+            help="unified API layer for for Inference, RAG, Agents, Tools, Safety, Evals, and Telemetry.",
+        )
     parser.add_argument("--authfile", help="path of the authentication file")
     if command in ["run", "perplexity", "serve"]:
         parser.add_argument(
             "-c",
             "--ctx-size",
             dest="context",
-            default=CONFIG['ctx_size'],
+            default=CONFIG.ctx_size,
             help="size of the prompt context (0 = loaded from model)",
             completer=suppressCompleter,
         )
@@ -754,7 +782,7 @@ def runtime_options(parser, command):
         dest="env",
         action='append',
         type=str,
-        default=CONFIG["env"],
+        default=CONFIG.env,
         help="environment variables to add to the running container",
         completer=local_env,
     )
@@ -767,7 +795,7 @@ def runtime_options(parser, command):
         )
         parser.add_argument(
             "--host",
-            default=CONFIG['host'],
+            default=CONFIG.host,
             help="IP address to listen",
             completer=suppressCompleter,
         )
@@ -794,7 +822,7 @@ def runtime_options(parser, command):
         "--ngl",
         dest="ngl",
         type=int,
-        default=CONFIG["ngl"],
+        default=CONFIG.ngl,
         help="number of layers to offload to the gpu, if available",
         completer=suppressCompleter,
     )
@@ -808,7 +836,7 @@ def runtime_options(parser, command):
             "-p",
             "--port",
             type=parse_port_option,
-            default=CONFIG['port'],
+            default=CONFIG.port,
             help="port for AI Model server to listen on",
             completer=suppressCompleter,
         )
@@ -819,7 +847,7 @@ def runtime_options(parser, command):
         "--pull",
         dest="pull",
         type=str,
-        default=CONFIG['pull'],
+        default=CONFIG.pull,
         choices=["always", "missing", "never", "newer"],
         help='pull image policy',
     )
@@ -839,7 +867,7 @@ def runtime_options(parser, command):
     parser.add_argument("--seed", help="override random seed", completer=suppressCompleter)
     parser.add_argument(
         "--temp",
-        default=CONFIG['temp'],
+        default=CONFIG.temp,
         help="temperature of the response from the AI model",
         completer=suppressCompleter,
     )
@@ -869,14 +897,31 @@ def runtime_options(parser, command):
 
 
 def default_threads():
-    if CONFIG["threads"] < 0:
+    if CONFIG.threads < 0:
         nproc = os.cpu_count()
         if nproc and nproc > 4:
             return int(nproc / 2)
 
         return 4
 
-    return CONFIG["threads"]
+    return CONFIG.threads
+
+
+def chat_parser(subparsers):
+    parser = subparsers.add_parser("chat", help="OpenAI chat with the specified RESTAPI URL")
+    parser.add_argument(
+        '--color',
+        '--colour',
+        default="auto",
+        choices=['never', 'always', 'auto'],
+        help='possible values are "never", "always" and "auto".',
+    )
+    parser.add_argument("--prefix", type=str, help="prefix for the user prompt", default=default_prefix())
+    parser.add_argument("--url", type=str, default="http://127.0.0.1:8080", help="the host to send requests to")
+    parser.add_argument(
+        "ARGS", nargs="*", help="overrides the default prompt, and the output is returned without entering the chatbot"
+    )
+    parser.set_defaults(func=chat_cli)
 
 
 def run_parser(subparsers):
@@ -893,12 +938,20 @@ def run_parser(subparsers):
     parser.set_defaults(func=run_cli)
 
 
+def chat_cli(args):
+    shell = RamaLamaShell(args)
+    if shell.handle_args():
+        return
+    shell.loop()
+    shell.kills()
+
+
 def run_cli(args):
     if args.rag:
         _get_rag(args)
         # Passing default args for serve (added network bridge for internet access)
-        args.port = CONFIG['port']
-        args.host = CONFIG['host']
+        args.port = CONFIG.port
+        args.host = CONFIG.host
         args.network = 'bridge'
         args.generate = ParsedGenerateInput("", "")
 
@@ -936,6 +989,13 @@ def serve_cli(args):
 
     if args.rag:
         _get_rag(args)
+
+    if args.api == "llama-stack":
+        if not args.container:
+            raise ValueError("ramalama serve --api llama-stack command cannot be run with the --nocontainer option.")
+
+        stack = Stack(args)
+        return stack.serve()
 
     try:
         model = New(args.MODEL, args)
@@ -1000,7 +1060,7 @@ def rag_parser(subparsers):
         dest="env",
         action='append',
         type=str,
-        default=CONFIG["env"],
+        default=CONFIG.env,
         help="environment variables to add to the running RAG container",
         completer=local_env,
     )
@@ -1009,7 +1069,7 @@ def rag_parser(subparsers):
         "--pull",
         dest="pull",
         type=str,
-        default=CONFIG['pull'],
+        default=CONFIG.pull,
         choices=["always", "missing", "never", "newer"],
         help='pull image policy',
     )
@@ -1024,7 +1084,7 @@ formatted files to be processed""",
     parser.add_argument(
         "--ocr",
         dest="ocr",
-        default=CONFIG["ocr"],
+        default=CONFIG.ocr,
         action="store_true",
         help="Enable embedded image text extraction from PDF (Increases RAM Usage significantly)",
     )
@@ -1079,15 +1139,9 @@ def rm_cli(args):
     if len(args.MODEL) > 0:
         raise IndexError("can not specify --all as well MODEL")
 
-    models = GlobalModelStore(args.store).list_models(
-        engine=args.engine, debug=args.debug, show_container=args.container
-    )
+    models = GlobalModelStore(args.store).list_models(engine=args.engine, show_container=args.container)
 
     return _rm_model([model for model in models.keys()], args)
-
-
-def New(model, args, transport=CONFIG["transport"]):
-    return ModelFactory(model, args, transport=transport).create()
 
 
 def client_cli(args):

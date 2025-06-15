@@ -1,0 +1,15 @@
+[Unit]
+Description=RamaLama modelfromstore AI Model Service
+After=local-fs.target
+
+[Container]
+AddDevice=-/dev/accel
+AddDevice=-/dev/dri
+AddDevice=-/dev/kfd
+Image=testimage
+Exec=
+Mount=type=bind,src=longpathtoablobsha,target=/mnt/models/model.file,ro,Z
+
+[Install]
+WantedBy=multi-user.target default.target
+
